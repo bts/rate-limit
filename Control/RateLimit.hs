@@ -43,6 +43,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad (void, when)
 import Data.Functor (($>))
+import Data.Time.Clock.System (SystemTime, getSystemTime, systemNanoseconds)
 import Data.Time.Units
 
 -- | The rate at which to limit an action.
@@ -123,13 +124,16 @@ generateRateLimitedFunction ratelimit action combiner = do
   return $ resultFunction chan
 
   where
-  currentMicros :: IO Integer
-  currentMicros = toMicroseconds `fmap` (getCPUTimeWithUnit :: IO Microsecond)
+  systemMicroseconds :: SystemTime -> Microsecond
+  systemMicroseconds = fromIntegral . systemNanoseconds
+
+  currentMicroseconds :: IO Integer
+  currentMicroseconds = toMicroseconds . systemMicroseconds <$> getSystemTime
 
   runner :: Integer -> TChan (req, MVar resp) -> IO a
   runner lastTime chan = do
     -- should we wait for some amount of time?
-    now <- currentMicros
+    now <- currentMicroseconds
     when (now - lastTime < toMicroseconds (getRate ratelimit)) $ do
       let delay = toMicroseconds (getRate ratelimit) - (now - lastTime)
       threadDelay (fromIntegral delay)
@@ -141,7 +145,7 @@ generateRateLimitedFunction ratelimit action combiner = do
     if shouldFork ratelimit
       then forkIO (action req' >>= finalHandler) >> return ()
       else action req' >>= finalHandler
-    nextTime <- currentMicros
+    nextTime <- currentMicroseconds
     runner nextTime chan
 
   -- updateRequestWithFollowers: We have one request. Can we combine it with
