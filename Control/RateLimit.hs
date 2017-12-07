@@ -41,9 +41,10 @@ module Control.RateLimit (
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Monad (void, when)
+import Control.Monad (void)
 import Data.Functor (($>))
-import Data.Time.Clock.System (SystemTime, getSystemTime, systemNanoseconds)
+import Data.Monoid ((<>))
+import Data.Time.Clock.System (getSystemTime, systemNanoseconds, systemSeconds)
 import Data.Time.Units
 
 -- | The rate at which to limit an action.
@@ -120,33 +121,62 @@ generateRateLimitedFunction :: forall req resp t
                             -> IO (req -> IO resp)
 generateRateLimitedFunction ratelimit action combiner = do
   chan <- atomically newTChan
-  void $ forkIO $ runner (-42) chan
+  void $ forkIO $ runner Nothing 0 chan
   return $ resultFunction chan
 
   where
-  systemMicroseconds :: SystemTime -> Microsecond
-  systemMicroseconds = fromIntegral . systemNanoseconds
-
   currentMicroseconds :: IO Integer
-  currentMicroseconds = toMicroseconds . systemMicroseconds <$> getSystemTime
+  currentMicroseconds = flip fmap getSystemTime $ \sysTime ->
+    let epochSeconds   = fromIntegral $ systemSeconds sysTime :: Second
+        subsecondNanos = fromIntegral $ systemNanoseconds sysTime :: Nanosecond
+    in toMicroseconds epochSeconds + toMicroseconds subsecondNanos
 
-  runner :: Integer -> TChan (req, MVar resp) -> IO a
-  runner lastTime chan = do
-    -- should we wait for some amount of time?
-    now <- currentMicroseconds
-    when (now - lastTime < toMicroseconds (getRate ratelimit)) $ do
-      let delay = toMicroseconds (getRate ratelimit) - (now - lastTime)
-      threadDelay (fromIntegral delay)
-    -- OK, we're ready for the next item
+  runner :: Maybe Integer -> Integer -> TChan (req, MVar resp) -> IO a
+  runner mLastRun lastAllowance chan = do
+
     (req, respMV) <- atomically $ readTChan chan
     let baseHandler resp = putMVar respMV resp
+
+    -- should we wait for some amount of time before running?
+    beforeWait <- currentMicroseconds
+    let targetDelay      = toMicroseconds $ getRate ratelimit
+        timeSinceLastRun = case mLastRun of
+          Just lastRun -> beforeWait - lastRun
+          Nothing -> negate targetDelay
+        -- We won't spend *all* of our allowance just yet; use only some of it
+        -- to smooth out delays
+        delay            = targetDelay - timeSinceLastRun - lastAllowance
+    -- putStrLn $ "following delay comes from: targetDelay of " <> show targetDelay
+    --         <> " timeSinceLastRun of " <> show timeSinceLastRun
+    --         <> " and lastAllowance " <> show lastAllowance
+    nextAllowance <- if delay < 0
+      then pure $ abs delay -- we have more allowance left
+      else do
+        -- putStrLn $ "sleeping for " <> show delay <> "μs"
+        -- sleep for a *minimum* of delay
+        threadDelay $ fromIntegral delay
+        afterWait <- currentMicroseconds
+        let slept = afterWait - beforeWait
+            over  = slept - delay
+        -- putStrLn $ "actually slept for " <> show slept <> "μs "
+        --         <> "(" <> show over <> " too long)"
+        return over
+
+    -- putStrLn $ "allowance is: " <> show nextAllowance
+
     -- can we combine this with any other requests on the pipe?
     (req', finalHandler) <- updateRequestWithFollowers chan req baseHandler
+    let run = action req' >>= finalHandler
+
+    beforeRun <- currentMicroseconds
     if shouldFork ratelimit
-      then forkIO (action req' >>= finalHandler) >> return ()
-      else action req' >>= finalHandler
-    nextTime <- currentMicroseconds
-    runner nextTime chan
+      then void $ forkIO run
+      else do
+        run
+        -- afterAction <- currentMicroseconds
+        -- putStrLn $ "action took " <> show (afterAction-beforeRun) <> "μs"
+
+    runner (Just beforeRun) nextAllowance chan
 
   -- updateRequestWithFollowers: We have one request. Can we combine it with
   -- some other requests into a cohesive whole?
